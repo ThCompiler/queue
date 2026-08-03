@@ -107,14 +107,15 @@ function tube.put(self, data, opts)
 end
 
 local conds = {}
+local CONSUMER_KEY_ANY = ''
 local releasing_connections = {}
 
-function tube.take(self, timeout)
+function tube.take(self, timeout, opts)
     if not check_state("take") then
         return nil
     end
     timeout = util.time(timeout or util.TIMEOUT_INFINITY)
-    local task = self.raw:take()
+    local task = self.raw:take(opts)
     if task ~= nil then
         return self.raw:normalize_task(task)
     end
@@ -125,8 +126,14 @@ function tube.take(self, timeout)
         local tid = self.tube_id
         local fid = fiber.id()
         local conn_id = connection.id()
+        local consumer_key = CONSUMER_KEY_ANY
+        if self.raw.consumer_key ~= nil then
+            consumer_key = self.raw:consumer_key(opts) or CONSUMER_KEY_ANY
+        end
 
-        box.space._queue_consumers:insert{conn_id, fid, tid, time, started}
+        box.space._queue_consumers:insert{
+            conn_id, fid, tid, time, started, consumer_key
+        }
         conds[fid] = qc.waiter()
         conds[fid]:wait(tonumber(timeout) / 1000000)
         conds[fid]:free()
@@ -139,7 +146,7 @@ function tube.take(self, timeout)
             return nil
         end
 
-        task = self.raw:take()
+        task = self.raw:take(opts)
 
         if task ~= nil then
             return self.raw:normalize_task(task)
@@ -430,6 +437,15 @@ end
 -- Cache of already verified drivers.
 local checked_drivers = {}
 
+local function find_consumer(consumers, tube_id, consumer_key)
+    local consumer = consumers.index.consumer:min{tube_id, consumer_key}
+    if consumer == nil or consumer[3] ~= tube_id or
+            consumer[6] ~= consumer_key then
+        return nil
+    end
+    return consumer
+end
+
 local function make_self(driver, space, tube_name, tube_type, tube_id, opts)
     opts = opts or {}
     local self
@@ -453,7 +469,19 @@ local function make_self(driver, space, tube_name, tube_type, tube_id, opts)
         -- task switched to ready (or new task)
         if task[2] == state.READY then
             local tube_id = self.tube_id
-            local consumer = queue_consumers.index.consumer:min{tube_id}
+            local task_consumer_key
+            if self.raw.consumer_key ~= nil then
+                task_consumer_key = self.raw:consumer_key(nil, task)
+            end
+            local consumer_key = task_consumer_key or CONSUMER_KEY_ANY
+            local consumer = find_consumer(queue_consumers, tube_id,
+                consumer_key)
+
+            if consumer == nil and task_consumer_key ~= nil then
+                -- A regular take() can consume a task from any consumer key.
+                consumer = find_consumer(queue_consumers, tube_id,
+                    CONSUMER_KEY_ANY)
+            end
 
             if consumer ~= nil then
                 if consumer[3] == tube_id then
@@ -785,7 +813,7 @@ function method.start()
 
     local _cons = box.space._queue_consumers
     if _cons == nil then
-        -- connection, fid, tube, time
+        -- connection, fid, tube, time, consumer key
         _cons = box.schema.create_space('_queue_consumers', {
             temporary = true,
             format = {
@@ -793,7 +821,8 @@ function method.start()
                 {name = 'fiber_id', type = num_type()},
                 {name = 'tube_id', type = num_type()},
                 {name = 'event_time', type = num_type()},
-                {name = 'fiber_time', type = num_type()}
+                {name = 'fiber_time', type = num_type()},
+                {name = 'consumer_key', type = str_type()}
             }
         })
         _cons:create_index('pk', {
@@ -803,8 +832,23 @@ function method.start()
         })
         _cons:create_index('consumer', {
             type = 'tree',
-            parts = {3, num_type(), 4, num_type()},
+            parts = {3, num_type(), 6, str_type(), 4, num_type()},
             unique = false
+        })
+    elseif _cons:format()[6] == nil then
+        -- Waiters are process-local. Drop old entries while upgrading the
+        -- temporary space to the keyed consumer format.
+        _cons:truncate()
+        _cons:format({
+            {name = 'connection_id', type = num_type()},
+            {name = 'fiber_id', type = num_type()},
+            {name = 'tube_id', type = num_type()},
+            {name = 'event_time', type = num_type()},
+            {name = 'fiber_time', type = num_type()},
+            {name = 'consumer_key', type = str_type()}
+        })
+        _cons.index.consumer:alter({
+            parts = {3, num_type(), 6, str_type(), 4, num_type()}
         })
     end
 
