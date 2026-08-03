@@ -107,14 +107,15 @@ function tube.put(self, data, opts)
 end
 
 local conds = {}
+local waiting_opts = {}
 local releasing_connections = {}
 
-function tube.take(self, timeout)
+function tube.take(self, timeout, opts)
     if not check_state("take") then
         return nil
     end
     timeout = util.time(timeout or util.TIMEOUT_INFINITY)
-    local task = self.raw:take()
+    local task = self.raw:take(opts)
     if task ~= nil then
         return self.raw:normalize_task(task)
     end
@@ -127,9 +128,12 @@ function tube.take(self, timeout)
         local conn_id = connection.id()
 
         box.space._queue_consumers:insert{conn_id, fid, tid, time, started}
+        waiting_opts[fid] = opts
         conds[fid] = qc.waiter()
         conds[fid]:wait(tonumber(timeout) / 1000000)
         conds[fid]:free()
+        conds[fid] = nil
+        waiting_opts[fid] = nil
         box.space._queue_consumers:delete{conn_id, fid}
 
         -- We don't take a task if the connection is in a
@@ -139,7 +143,7 @@ function tube.take(self, timeout)
             return nil
         end
 
-        task = self.raw:take()
+        task = self.raw:take(opts)
 
         if task ~= nil then
             return self.raw:normalize_task(task)
@@ -435,7 +439,7 @@ local function make_self(driver, space, tube_name, tube_type, tube_id, opts)
     local self
 
     -- wakeup consumer if queue have new task
-    local on_task_change = function(task, stats_data)
+    local on_task_change = function(task, stats_data, matches_wait)
         self.on_task_change_cb(task, stats_data)
 
         -- task was removed
@@ -453,15 +457,18 @@ local function make_self(driver, space, tube_name, tube_type, tube_id, opts)
         -- task switched to ready (or new task)
         if task[2] == state.READY then
             local tube_id = self.tube_id
-            local consumer = queue_consumers.index.consumer:min{tube_id}
+            for _, consumer in queue_consumers.index.consumer:pairs(
+                    tube_id, {iterator = 'GE'}) do
+                if consumer[3] ~= tube_id then
+                    break
+                end
 
-            if consumer ~= nil then
-                if consumer[3] == tube_id then
+                local cond = conds[consumer[2]]
+                if cond ~= nil and (matches_wait == nil or
+                        matches_wait(waiting_opts[consumer[2]])) then
                     queue_consumers:delete{consumer[1], consumer[2]}
-                    local cond = conds[consumer[2]]
-                    if cond then
-                        cond:signal(consumer[2])
-                    end
+                    cond:signal(consumer[2])
+                    break
                 end
             end
         -- task switched to taken - register in taken space

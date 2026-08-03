@@ -367,7 +367,13 @@ function tube.new(space, on_task_change, opts)
         end
     end
 
-    on_task_change = on_task_change or (function() end)
+    local notify = on_task_change or (function() end)
+    on_task_change = function(task, stats_data)
+        notify(task, stats_data, function(take_opts)
+            return take_opts == nil or take_opts.utube == nil or
+                task[i_utube] == tostring(take_opts.utube)
+        end)
+    end
     local self = setmetatable({
         space              = space,
         space_ready_buffer = space_ready_buffer,
